@@ -853,37 +853,38 @@ function ResultsPanel({ entry, onDownload }) {
   );
 }
 
-const WELSHDAG_EXPLORER = "https://explorer.welshdag.co.uk";
+const EXPLORERS = [
+  { name: "Community Explorer", base: "https://explorer.welshdag.co.uk" },
+  { name: "BlockDAG Engineering", base: "https://explorer.blockdag.engineering" },
+];
 
 function isLikelyAddress(addr) {
   return /^0x[a-fA-F0-9]{40}$/.test(addr.trim());
 }
 
-async function fetchVerifiedSource(address) {
-  const url = `${WELSHDAG_EXPLORER}/api/v2/smart-contracts/${address.trim()}`;
+async function fetchFromOneExplorer(baseUrl, explorerName, address) {
+  const url = `${baseUrl}/api/v2/smart-contracts/${address.trim()}`;
   let res;
   try {
     res = await fetch(url, { headers: { Accept: "application/json" } });
   } catch (e) {
-    throw new Error(
-      "Couldn't reach the WelshDAG explorer — network error or CORS block. Try again, or paste the source manually."
-    );
+    throw new Error(`${explorerName}: couldn't reach it (network error or CORS block).`);
   }
   if (res.status === 404) {
-    throw new Error("No verified contract found at that address on WelshDAG's explorer.");
+    throw new Error(`${explorerName}: no verified contract found at that address.`);
   }
   if (!res.ok) {
-    throw new Error(`Explorer returned HTTP ${res.status}. It may be down — try again shortly.`);
+    throw new Error(`${explorerName}: returned HTTP ${res.status}, may be down.`);
   }
   let data;
   try {
     data = await res.json();
   } catch (e) {
-    throw new Error("Explorer response wasn't valid JSON.");
+    throw new Error(`${explorerName}: response wasn't valid JSON.`);
   }
   const primary = data.source_code;
   if (!primary) {
-    throw new Error("That contract exists but doesn't appear to be verified (no source_code in the response).");
+    throw new Error(`${explorerName}: contract exists but isn't verified there (no source_code in the response).`);
   }
   const files = [{ name: `${data.name || "Contract"}.sol`, code: primary }];
   if (Array.isArray(data.additional_sources)) {
@@ -892,6 +893,19 @@ async function fetchVerifiedSource(address) {
     });
   }
   return { files, name: data.name, compilerVersion: data.compiler_version };
+}
+
+async function fetchVerifiedSource(address) {
+  const errors = [];
+  for (const explorer of EXPLORERS) {
+    try {
+      const result = await fetchFromOneExplorer(explorer.base, explorer.name, address);
+      return { ...result, explorerName: explorer.name };
+    } catch (e) {
+      errors.push(e.message);
+    }
+  }
+  throw new Error(errors.join(" "));
 }
 
 async function storageGet(key) {
@@ -985,12 +999,14 @@ export default function App() {
     }
     setFetchLoading(true);
     try {
-      const { files: fetched, name } = await fetchVerifiedSource(fetchAddress);
+      const { files: fetched, name, explorerName } = await fetchVerifiedSource(fetchAddress);
       setFiles((fs) => [
         ...fs,
         ...fetched.map((f) => ({ id: uid(), name: f.name, type: "solidity", code: f.code })),
       ]);
-      setFetchOk(`Loaded ${fetched.length} file${fetched.length === 1 ? "" : "s"} for "${name || fetchAddress}".`);
+      setFetchOk(
+        `Loaded ${fetched.length} file${fetched.length === 1 ? "" : "s"} for "${name || fetchAddress}" via ${explorerName}.`
+      );
       setFetchAddress("");
     } catch (e) {
       setFetchError(e.message);
@@ -1133,32 +1149,43 @@ export default function App() {
           pointer-events: none;
           background-color: var(--void);
           background-image:
-            radial-gradient(1.4px 1.4px at 8% 12%, rgba(255,255,255,0.9), transparent 100%),
-            radial-gradient(1px 1px at 22% 28%, rgba(255,255,255,0.6), transparent 100%),
-            radial-gradient(1.3px 1.3px at 36% 6%, rgba(255,255,255,0.75), transparent 100%),
-            radial-gradient(1px 1px at 52% 22%, rgba(58,221,255,0.55), transparent 100%),
-            radial-gradient(1.4px 1.4px at 68% 9%, rgba(255,255,255,0.7), transparent 100%),
-            radial-gradient(1px 1px at 81% 31%, rgba(255,255,255,0.5), transparent 100%),
-            radial-gradient(1.3px 1.3px at 91% 4%, rgba(168,85,247,0.55), transparent 100%),
-            radial-gradient(1px 1px at 14% 45%, rgba(255,255,255,0.55), transparent 100%),
-            radial-gradient(1.4px 1.4px at 29% 58%, rgba(255,255,255,0.8), transparent 100%),
-            radial-gradient(1px 1px at 45% 67%, rgba(58,221,255,0.45), transparent 100%),
-            radial-gradient(1.3px 1.3px at 59% 49%, rgba(255,255,255,0.6), transparent 100%),
-            radial-gradient(1px 1px at 73% 72%, rgba(255,255,255,0.5), transparent 100%),
-            radial-gradient(1.4px 1.4px at 87% 55%, rgba(255,255,255,0.75), transparent 100%),
-            radial-gradient(1px 1px at 6% 81%, rgba(255,255,255,0.55), transparent 100%),
-            radial-gradient(1.3px 1.3px at 24% 90%, rgba(168,85,247,0.4), transparent 100%),
-            radial-gradient(1px 1px at 41% 84%, rgba(255,255,255,0.65), transparent 100%),
-            radial-gradient(1.4px 1.4px at 63% 93%, rgba(255,255,255,0.7), transparent 100%),
-            radial-gradient(1px 1px at 78% 88%, rgba(58,221,255,0.5), transparent 100%),
-            radial-gradient(1.3px 1.3px at 95% 77%, rgba(255,255,255,0.6), transparent 100%),
-            radial-gradient(ellipse 900px 650px at 18% -8%, rgba(120,60,190,0.20), transparent 60%),
-            radial-gradient(ellipse 850px 650px at 100% 105%, rgba(20,120,160,0.16), transparent 60%);
+            radial-gradient(2.5px 2.5px at 8% 12%, #ffffff, transparent 100%),
+            radial-gradient(1.5px 1.5px at 22% 28%, rgba(255,255,255,0.85), transparent 100%),
+            radial-gradient(3px 3px at 36% 6%, #ffffff, transparent 100%),
+            radial-gradient(1.5px 1.5px at 52% 22%, rgba(58,221,255,0.9), transparent 100%),
+            radial-gradient(2.2px 2.2px at 68% 9%, #ffffff, transparent 100%),
+            radial-gradient(1.5px 1.5px at 81% 31%, rgba(255,255,255,0.8), transparent 100%),
+            radial-gradient(2.8px 2.8px at 91% 4%, rgba(168,85,247,0.95), transparent 100%),
+            radial-gradient(1.5px 1.5px at 14% 45%, rgba(255,255,255,0.8), transparent 100%),
+            radial-gradient(2.5px 2.5px at 29% 58%, #ffffff, transparent 100%),
+            radial-gradient(1.6px 1.6px at 45% 67%, rgba(58,221,255,0.85), transparent 100%),
+            radial-gradient(2px 2px at 59% 49%, rgba(255,255,255,0.85), transparent 100%),
+            radial-gradient(1.5px 1.5px at 73% 72%, rgba(255,255,255,0.75), transparent 100%),
+            radial-gradient(2.8px 2.8px at 87% 55%, #ffffff, transparent 100%),
+            radial-gradient(1.5px 1.5px at 6% 81%, rgba(255,255,255,0.8), transparent 100%),
+            radial-gradient(2.3px 2.3px at 24% 90%, rgba(168,85,247,0.85), transparent 100%),
+            radial-gradient(1.6px 1.6px at 41% 84%, rgba(255,255,255,0.9), transparent 100%),
+            radial-gradient(2.6px 2.6px at 63% 93%, #ffffff, transparent 100%),
+            radial-gradient(1.6px 1.6px at 78% 88%, rgba(58,221,255,0.8), transparent 100%),
+            radial-gradient(2.2px 2.2px at 95% 77%, rgba(255,255,255,0.85), transparent 100%),
+            radial-gradient(1.4px 1.4px at 3% 65%, rgba(255,255,255,0.6), transparent 100%),
+            radial-gradient(1.8px 1.8px at 17% 3%, rgba(255,255,255,0.7), transparent 100%),
+            radial-gradient(1.4px 1.4px at 33% 38%, rgba(58,221,255,0.6), transparent 100%),
+            radial-gradient(1.8px 1.8px at 48% 12%, rgba(255,255,255,0.65), transparent 100%),
+            radial-gradient(1.4px 1.4px at 57% 78%, rgba(255,255,255,0.6), transparent 100%),
+            radial-gradient(1.8px 1.8px at 71% 40%, rgba(168,85,247,0.6), transparent 100%),
+            radial-gradient(1.4px 1.4px at 84% 20%, rgba(255,255,255,0.65), transparent 100%),
+            radial-gradient(1.8px 1.8px at 98% 60%, rgba(255,255,255,0.6), transparent 100%),
+            radial-gradient(1.4px 1.4px at 11% 96%, rgba(255,255,255,0.6), transparent 100%),
+            radial-gradient(1.8px 1.8px at 39% 96%, rgba(58,221,255,0.55), transparent 100%),
+            radial-gradient(1.4px 1.4px at 54% 33%, rgba(255,255,255,0.55), transparent 100%),
+            radial-gradient(ellipse 1100px 800px at 15% -10%, rgba(140,70,220,0.32), transparent 62%),
+            radial-gradient(ellipse 1000px 800px at 102% 108%, rgba(25,140,190,0.28), transparent 62%);
           background-repeat: no-repeat;
-          animation: twinkle 7s ease-in-out infinite alternate;
+          animation: twinkle 5s ease-in-out infinite alternate;
         }
         @keyframes twinkle {
-          from { opacity: 0.8; }
+          from { opacity: 0.65; }
           to { opacity: 1; }
         }
         .auditrace-app * { box-sizing: border-box; }
@@ -1368,8 +1395,9 @@ export default function App() {
             <div className="panel">
               <div className="panel-title">Fetch a deployed contract (optional)</div>
               <p className="hint" style={{ lineHeight: 1.6, marginBottom: 10 }}>
-                Pulls verified source from WelshDAG's Blockscout explorer — a fork/community chain, not the official
-                BlockDAG mainnet explorer (which is down as of this writing). Only works if the contract is verified.
+                Tries a community Blockscout explorer first, then falls back to BlockDAG Engineering's if that one's
+                down or the contract isn't verified there. Both are community/fork chains — neither is confirmed to
+                be the official BlockDAG mainnet explorer. Only works if the contract is verified on one of them.
               </p>
               <div className="fetch-row">
                 <input

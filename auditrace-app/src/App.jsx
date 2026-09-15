@@ -866,7 +866,7 @@ async function fetchVerifiedSource(address) {
     res = await fetch(url, { headers: { Accept: "application/json" } });
   } catch (e) {
     throw new Error(
-      "Couldn't reach the WelshDAG explorer (network error or CORS block). Try again, or paste the source manually."
+      "Couldn't reach the WelshDAG explorer — network error or CORS block. Try again, or paste the source manually."
     );
   }
   if (res.status === 404) {
@@ -892,6 +892,25 @@ async function fetchVerifiedSource(address) {
     });
   }
   return { files, name: data.name, compilerVersion: data.compiler_version };
+}
+
+async function storageGet(key) {
+  if (typeof window === "undefined") return null;
+  if (window.storage) {
+    const res = await window.storage.get(key, false);
+    return res ? res.value : null;
+  }
+  return window.localStorage.getItem(key);
+}
+
+async function storageSet(key, value) {
+  if (typeof window === "undefined") return false;
+  if (window.storage) {
+    const res = await window.storage.set(key, value, false);
+    return !!res;
+  }
+  window.localStorage.setItem(key, value);
+  return true;
 }
 
 const emptyFile = (type, idx) => ({
@@ -926,15 +945,12 @@ export default function App() {
 
   async function loadHistory() {
     try {
-      if (typeof window === "undefined" || !window.storage) {
-        setStorageAvailable(false);
-        setHistoryLoaded(true);
-        return;
-      }
-      const res = await window.storage.get("audit-history", false);
-      setHistory(res && res.value ? JSON.parse(res.value) : []);
+      const value = await storageGet("audit-history");
+      setHistory(value ? JSON.parse(value) : []);
+      setStorageAvailable(true);
     } catch (e) {
       setHistory([]);
+      setStorageAvailable(false);
     } finally {
       setHistoryLoaded(true);
     }
@@ -942,11 +958,11 @@ export default function App() {
 
   async function persistHistory(next) {
     setHistory(next);
-    if (!storageAvailable) return;
     try {
-      await window.storage.set("audit-history", JSON.stringify(next), false);
+      const ok = await storageSet("audit-history", JSON.stringify(next));
+      setStorageAvailable(ok);
     } catch (e) {
-      // best-effort; keep in-memory state regardless
+      setStorageAvailable(false);
     }
   }
 
@@ -1079,6 +1095,15 @@ export default function App() {
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap');
 
+        html, body {
+          margin: 0;
+          padding: 0;
+          background: #05070c;
+        }
+        #root {
+          min-height: 100vh;
+        }
+
         .auditrace-app {
           --void: #05070c;
           --panel: #0b0e16;
@@ -1091,12 +1116,50 @@ export default function App() {
           --coral: #ff8f6d;
           --amber: #f5c451;
           --danger: #ff4d6d;
+          position: relative;
           background: var(--void);
           color: var(--text);
           font-family: 'Inter', system-ui, sans-serif;
           min-height: 100vh;
           padding: 28px 20px 72px;
           box-sizing: border-box;
+          overflow-x: hidden;
+        }
+        .auditrace-app::before {
+          content: "";
+          position: fixed;
+          inset: 0;
+          z-index: -1;
+          pointer-events: none;
+          background-color: var(--void);
+          background-image:
+            radial-gradient(1.4px 1.4px at 8% 12%, rgba(255,255,255,0.9), transparent 100%),
+            radial-gradient(1px 1px at 22% 28%, rgba(255,255,255,0.6), transparent 100%),
+            radial-gradient(1.3px 1.3px at 36% 6%, rgba(255,255,255,0.75), transparent 100%),
+            radial-gradient(1px 1px at 52% 22%, rgba(58,221,255,0.55), transparent 100%),
+            radial-gradient(1.4px 1.4px at 68% 9%, rgba(255,255,255,0.7), transparent 100%),
+            radial-gradient(1px 1px at 81% 31%, rgba(255,255,255,0.5), transparent 100%),
+            radial-gradient(1.3px 1.3px at 91% 4%, rgba(168,85,247,0.55), transparent 100%),
+            radial-gradient(1px 1px at 14% 45%, rgba(255,255,255,0.55), transparent 100%),
+            radial-gradient(1.4px 1.4px at 29% 58%, rgba(255,255,255,0.8), transparent 100%),
+            radial-gradient(1px 1px at 45% 67%, rgba(58,221,255,0.45), transparent 100%),
+            radial-gradient(1.3px 1.3px at 59% 49%, rgba(255,255,255,0.6), transparent 100%),
+            radial-gradient(1px 1px at 73% 72%, rgba(255,255,255,0.5), transparent 100%),
+            radial-gradient(1.4px 1.4px at 87% 55%, rgba(255,255,255,0.75), transparent 100%),
+            radial-gradient(1px 1px at 6% 81%, rgba(255,255,255,0.55), transparent 100%),
+            radial-gradient(1.3px 1.3px at 24% 90%, rgba(168,85,247,0.4), transparent 100%),
+            radial-gradient(1px 1px at 41% 84%, rgba(255,255,255,0.65), transparent 100%),
+            radial-gradient(1.4px 1.4px at 63% 93%, rgba(255,255,255,0.7), transparent 100%),
+            radial-gradient(1px 1px at 78% 88%, rgba(58,221,255,0.5), transparent 100%),
+            radial-gradient(1.3px 1.3px at 95% 77%, rgba(255,255,255,0.6), transparent 100%),
+            radial-gradient(ellipse 900px 650px at 18% -8%, rgba(120,60,190,0.20), transparent 60%),
+            radial-gradient(ellipse 850px 650px at 100% 105%, rgba(20,120,160,0.16), transparent 60%);
+          background-repeat: no-repeat;
+          animation: twinkle 7s ease-in-out infinite alternate;
+        }
+        @keyframes twinkle {
+          from { opacity: 0.8; }
+          to { opacity: 1; }
         }
         .auditrace-app * { box-sizing: border-box; }
         .mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
@@ -1427,7 +1490,7 @@ export default function App() {
             </div>
             {!storageAvailable && (
               <div className="hint" style={{ marginBottom: 14 }}>
-                History storage isn't available in this preview — audits won't persist after you close this session.
+                History storage isn't available in this browser — audits won't persist after you close this session.
               </div>
             )}
             {historyLoaded && history.length === 0 && (

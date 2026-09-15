@@ -2,6 +2,7 @@
 
 Static analysis for Solidity contracts and dapp/frontend code, built for chain 1404 (BlockDAG).
 
+
 ## Run locally
 
 ```

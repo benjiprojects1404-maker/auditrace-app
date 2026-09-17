@@ -11,6 +11,7 @@ import {
   AlertTriangle,
   AlertOctagon,
   Info,
+  Copy,
   X,
 } from "lucide-react";
 
@@ -134,6 +135,18 @@ function analyzeSolidity(code, fileName) {
       line: isLine ? idxOrLine : lineOf(code, idxOrLine),
       message,
       recommendation,
+      category: "security",
+    });
+  };
+  const addGas = (title, idxOrLine, message, recommendation, isLine) => {
+    findings.push({
+      file: fileName,
+      severity: "info",
+      title,
+      line: isLine ? idxOrLine : lineOf(code, idxOrLine),
+      message,
+      recommendation,
+      category: "gas",
     });
   };
 
@@ -282,6 +295,31 @@ function analyzeSolidity(code, fileName) {
     )
   );
 
+  forEachMatch(code, /\.(transferFrom|approve)\(/g, (idx, m) => {
+    const before = code.slice(Math.max(0, idx - 60), idx);
+    const after = code.slice(idx, idx + 100);
+    const looksChecked = /require\s*\($/.test(before.trim()) || /require\s*\(/.test(after.slice(0, 60));
+    if (!looksChecked) {
+      add(
+        "medium",
+        `Unchecked ERC20 ${m[1]} return value`,
+        idx,
+        `A .${m[1]}(...) call is made without checking its boolean return value. Some ERC20 tokens return false on failure instead of reverting.`,
+        "Wrap the call in require(...), or use OpenZeppelin's SafeERC20 (safeTransferFrom/safeApprove), which reverts automatically on failure."
+      );
+    }
+  });
+
+  if (/function\s+transferOwnership\s*\(/.test(code) && !/Ownable2Step/.test(code)) {
+    add(
+      "info",
+      "Single-step ownership transfer",
+      code.indexOf("transferOwnership"),
+      "Ownership transfers in one step here, so a mistyped or unreachable new-owner address would permanently lock out admin control.",
+      "Consider OpenZeppelin's Ownable2Step, which requires the new owner to explicitly accept the role before it takes effect."
+    );
+  }
+
   const knownModifiers = Array.from(ctx.modifiers);
   const functions = splitFunctions(code);
 
@@ -293,7 +331,7 @@ function analyzeSolidity(code, fileName) {
 
     // Reentrancy: only fires when the assignment target after the external
     // call is a real, contract-level state variable — not just any identifier.
-    const callIdx = fn.body.search(/\.call\{[^}]*\}\(|\.call\(|\.send\(|\.transfer\(/);
+    const callIdx = fn.body.search(/\.call\{[^}]*\}\(|\.call\(|\.send\(|\.transfer\(|_safeMint\(|safeTransferFrom\(|_safeTransfer\(/);
     if (callIdx !== -1 && !hasReentrancyGuard) {
       const after = fn.body.slice(callIdx);
       const assignRe = /\n\s*([a-zA-Z_][\w.\[\]]*)\s*(\+=|-=|=)(?!=)/g;
@@ -407,6 +445,30 @@ function analyzeSolidity(code, fileName) {
     }
   });
 
+  // --- Gas optimization suggestions (separate from security findings) ---
+  forEachMatch(code, /for\s*\(\s*[^;]*;\s*[a-zA-Z_]\w*\s*<\s*([a-zA-Z_][\w.]*)\.length\s*;/g, (idx, m) =>
+    addGas(
+      "Array length read on every loop iteration",
+      idx,
+      `This loop re-reads "${m[1]}.length" on every iteration instead of caching it.`,
+      `Cache the length in a local variable before the loop (e.g. uint256 len = ${m[1]}.length;) — cheaper than a repeated storage/calldata read, especially for storage arrays.`
+    )
+  );
+
+  functions.forEach((fn) => {
+    ctx.stateVars.forEach((sv) => {
+      const count = (fn.body.match(new RegExp(`\\b${sv}\\b`, "g")) || []).length;
+      if (count >= 4) {
+        addGas(
+          `Repeated reads of state variable "${sv}"`,
+          fn.start,
+          `Function "${fn.name}" reads state variable "${sv}" ${count} times.`,
+          `Cache "${sv}" in a local memory variable at the start of the function — each storage read costs more gas than a memory read.`
+        );
+      }
+    });
+  });
+
   // Locked ether: contract accepts value but no function appears to send it back out
   if (/\bpayable\b/.test(code)) {
     const anyWithdraw = functions.some((fn) => /\.transfer\(|\.send\(|\.call\{[^}]*value/.test(fn.body));
@@ -480,7 +542,7 @@ function analyzeSolidity(code, fileName) {
 function analyzeFrontend(code, fileName) {
   const findings = [];
   const add = (severity, title, idx, message, recommendation) =>
-    findings.push({ file: fileName, severity, title, line: lineOf(code, idx), message, recommendation });
+    findings.push({ file: fileName, severity, title, line: lineOf(code, idx), message, recommendation, category: "security" });
 
   forEachMatch(code, /0x[a-fA-F0-9]{64}(?![a-fA-F0-9])/g, (idx) =>
     add(
@@ -653,12 +715,115 @@ function parseSlitherJson(text) {
       message: (d.description || "").trim().replace(/\s+/g, " "),
       recommendation: `See Slither's "${d.check}" detector documentation for the recommended fix.`,
       source: "slither",
+      category: "security",
     };
   });
 }
 
+function diffFindings(current, previous) {
+  const secCurrent = current.filter((f) => f.category !== "gas");
+  const secPrevious = previous.filter((f) => f.category !== "gas");
+  const key = (f) => `${f.file}::${f.title}`;
+  const curMap = new Map(secCurrent.map((f) => [key(f), f]));
+  const prevMap = new Map(secPrevious.map((f) => [key(f), f]));
+  const newOnes = [...curMap.entries()].filter(([k]) => !prevMap.has(k)).map(([, f]) => f);
+  const resolved = [...prevMap.entries()].filter(([k]) => !curMap.has(k)).map(([, f]) => f);
+  const unchanged = [...curMap.entries()].filter(([k]) => prevMap.has(k)).length;
+  return { newOnes, resolved, unchanged };
+}
+
+function findPreviousComparable(history, currentEntry) {
+  if (!currentEntry) return null;
+  const fileSet = new Set(currentEntry.fileNames);
+  for (const h of history) {
+    if (h.id === currentEntry.id) continue;
+    if (h.timestamp >= currentEntry.timestamp) continue;
+    if (h.fileNames.some((n) => fileSet.has(n))) return h;
+  }
+  return null;
+}
+
+function computeStats(activeFiles) {
+  let lines = 0;
+  let functions = 0;
+  let externalCalls = 0;
+  activeFiles.forEach((f) => {
+    if (f.type !== "solidity") return;
+    lines += f.code.split("\n").length;
+    functions += splitFunctions(f.code).length;
+    const matches = f.code.match(/\.call\{[^}]*\}\(|\.call\(|\.send\(|\.transfer\(/g);
+    externalCalls += matches ? matches.length : 0;
+  });
+  return { lines, functions, externalCalls };
+}
+
+function parseGithubRepoInput(input) {
+  let s = input.trim();
+  s = s.replace(/^https?:\/\/(www\.)?github\.com\//i, "");
+  s = s.replace(/\.git$/i, "");
+  s = s.replace(/\/tree\/.*$/i, "");
+  const parts = s.split("/").filter(Boolean);
+  if (parts.length < 2) return null;
+  return { owner: parts[0], repo: parts[1] };
+}
+
+async function scanGithubRepo(input) {
+  const parsed = parseGithubRepoInput(input);
+  if (!parsed) {
+    throw new Error("That doesn't look like a GitHub repo (expected owner/repo or a github.com URL).");
+  }
+  const { owner, repo } = parsed;
+  const ghHeaders = { Accept: "application/vnd.github+json" };
+
+  let repoRes;
+  try {
+    repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers: ghHeaders });
+  } catch (e) {
+    throw new Error("Couldn't reach GitHub's API (network error or CORS block).");
+  }
+  if (repoRes.status === 404) throw new Error(`Repo "${owner}/${repo}" not found (private repos aren't supported).`);
+  if (repoRes.status === 403) throw new Error("GitHub API rate limit hit. Wait a bit and try again.");
+  if (!repoRes.ok) throw new Error(`GitHub API returned HTTP ${repoRes.status}.`);
+  const repoData = await repoRes.json();
+  const branch = repoData.default_branch || "main";
+
+  let treeRes;
+  try {
+    treeRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, {
+      headers: ghHeaders,
+    });
+  } catch (e) {
+    throw new Error("Couldn't reach GitHub's API to list files (network error or CORS block).");
+  }
+  if (!treeRes.ok) throw new Error(`Couldn't list files in the repo (HTTP ${treeRes.status}).`);
+  const treeData = await treeRes.json();
+  const solFiles = (treeData.tree || [])
+    .filter((item) => item.type === "blob" && /\.sol$/i.test(item.path))
+    .filter((item) => !/node_modules\//.test(item.path));
+
+  if (solFiles.length === 0) throw new Error(`No .sol files found on ${owner}/${repo}'s ${branch} branch.`);
+
+  const capped = solFiles.slice(0, 40);
+  const results = [];
+  const failures = [];
+  for (const item of capped) {
+    try {
+      const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${item.path}`;
+      const res = await fetch(rawUrl);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const code = await res.text();
+      results.push({ name: item.path, code });
+    } catch (e) {
+      failures.push(item.path);
+    }
+  }
+  return { files: results, failures, total: solFiles.length, wasCapped: solFiles.length > 40, branch };
+}
+
 function computeScore(findings) {
-  const deduction = findings.reduce((sum, f) => sum + (SEVERITY_META[f.severity]?.weight || 0), 0);
+  const deduction = findings
+    .filter((f) => f.category !== "gas")
+    .reduce((sum, f) => sum + (SEVERITY_META[f.severity]?.weight || 0), 0);
   return Math.max(0, Math.min(100, Math.round(100 - deduction)));
 }
 
@@ -677,6 +842,8 @@ function scoreColor(score) {
 }
 
 function buildMarkdownReport(entry) {
+  const securityFindings = entry.findings.filter((f) => f.category !== "gas");
+  const gasFindings = entry.findings.filter((f) => f.category === "gas");
   const lines = [];
   lines.push("# Auditrace report");
   lines.push("");
@@ -690,7 +857,7 @@ function buildMarkdownReport(entry) {
   SEVERITY_ORDER.forEach((s) => lines.push(`| ${SEVERITY_META[s].label} | ${entry.summary[s] || 0} |`));
   lines.push("");
   SEVERITY_ORDER.forEach((s) => {
-    const items = entry.findings.filter((f) => f.severity === s);
+    const items = securityFindings.filter((f) => f.severity === s);
     if (!items.length) return;
     lines.push(`## ${SEVERITY_META[s].label} (${items.length})`);
     items.forEach((f) => {
@@ -704,6 +871,19 @@ function buildMarkdownReport(entry) {
     });
     lines.push("");
   });
+  if (gasFindings.length) {
+    lines.push(`## Gas suggestions (${gasFindings.length})`);
+    gasFindings.forEach((f) => {
+      lines.push("");
+      lines.push(`### ${f.title}`);
+      lines.push(`File: ${f.file}, line ${f.line}`);
+      lines.push("");
+      lines.push(f.message);
+      lines.push("");
+      lines.push(`Suggestion: ${f.recommendation}`);
+    });
+    lines.push("");
+  }
   lines.push("---");
   lines.push(
     "Auditrace performs automated static analysis only. It flags known patterns and heuristics, cannot guarantee full coverage, cannot compile or execute your contracts, and is not a substitute for a manual audit by a qualified security engineer before mainnet deployment."
@@ -797,13 +977,72 @@ function FindingCard({ f }) {
   );
 }
 
-function ResultsPanel({ entry, onDownload }) {
+function DiffBanner({ entry, previousEntry }) {
+  const diff = diffFindings(entry.findings, previousEntry.findings);
+  const dateStr = new Date(previousEntry.timestamp).toLocaleDateString();
+  if (diff.newOnes.length === 0 && diff.resolved.length === 0) {
+    return (
+      <div className="diff-banner diff-neutral">No change in findings since your last scan of these files ({dateStr}).</div>
+    );
+  }
+  return (
+    <details className="diff-banner">
+      <summary>
+        <span>vs. scan on {dateStr}:</span>
+        {diff.resolved.length > 0 && <span className="diff-tag diff-resolved">{diff.resolved.length} resolved</span>}
+        {diff.newOnes.length > 0 && <span className="diff-tag diff-new">{diff.newOnes.length} new</span>}
+        {diff.unchanged > 0 && <span className="diff-tag diff-unchanged">{diff.unchanged} unchanged</span>}
+      </summary>
+      <div className="diff-body">
+        {diff.newOnes.length > 0 && (
+          <div className="diff-section">
+            <div className="diff-section-title diff-new">New</div>
+            {diff.newOnes.map((f, i) => (
+              <div key={i} className="diff-item">
+                {f.title} — {f.file}
+              </div>
+            ))}
+          </div>
+        )}
+        {diff.resolved.length > 0 && (
+          <div className="diff-section">
+            <div className="diff-section-title diff-resolved">Resolved</div>
+            {diff.resolved.map((f, i) => (
+              <div key={i} className="diff-item">
+                {f.title} — {f.file}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </details>
+  );
+}
+
+function ResultsPanel({ entry, onDownload, previousEntry }) {
+  const [copied, setCopied] = useState(false);
+  const securityFindings = entry.findings.filter((f) => f.category !== "gas");
+  const gasFindings = entry.findings.filter((f) => f.category === "gas");
+
+  async function handleCopy() {
+    const md = buildMarkdownReport(entry);
+    try {
+      await navigator.clipboard.writeText(md);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {
+      // clipboard API unavailable — silently no-op, download button still works
+    }
+  }
+
   return (
     <div className="results">
       <div className="disclaimer">
         Automated static analysis only. Auditrace flags known patterns — it can't compile, execute, or guarantee
         full coverage of your code, and isn't a substitute for a manual audit before mainnet deployment.
       </div>
+
+      {previousEntry && <DiffBanner entry={entry} previousEntry={previousEntry} />}
 
       <div className="score-row">
         <ScoreDial score={entry.score} />
@@ -816,26 +1055,37 @@ function ResultsPanel({ entry, onDownload }) {
               </span>
             ))}
           </div>
+          {entry.stats && (
+            <div className="stats-row">
+              {entry.stats.lines} lines · {entry.stats.functions} functions · {entry.stats.externalCalls} external
+              calls
+            </div>
+          )}
           <div className="chips">
             {SEVERITY_ORDER.map((s) => (
               <SeverityChip key={s} sev={s} count={entry.summary[s] || 0} />
             ))}
           </div>
-          <button className="btn-outline" onClick={() => onDownload(entry)}>
-            <Download size={15} /> Download report
-          </button>
+          <div className="results-actions">
+            <button className="btn-outline" onClick={() => onDownload(entry)}>
+              <Download size={15} /> Download report
+            </button>
+            <button className="btn-outline" onClick={handleCopy}>
+              <Copy size={14} /> {copied ? "Copied" : "Copy as Markdown"}
+            </button>
+          </div>
         </div>
       </div>
 
       <div className="findings-list">
-        {entry.findings.length === 0 && (
+        {securityFindings.length === 0 && (
           <div className="empty-good">
             <ShieldCheck size={20} />
-            No pattern-based findings. That's a good sign — it isn't a guarantee.
+            No pattern-based security findings. That's a good sign — it isn't a guarantee.
           </div>
         )}
         {SEVERITY_ORDER.map((s) => {
-          const items = entry.findings.filter((f) => f.severity === s);
+          const items = securityFindings.filter((f) => f.severity === s);
           if (!items.length) return null;
           return (
             <div key={s} className="finding-group">
@@ -848,6 +1098,16 @@ function ResultsPanel({ entry, onDownload }) {
             </div>
           );
         })}
+        {gasFindings.length > 0 && (
+          <div className="finding-group">
+            <div className="finding-group-title" style={{ "--gcolor": "var(--amber)" }}>
+              Gas suggestions ({gasFindings.length})
+            </div>
+            {gasFindings.map((f, i) => (
+              <FindingCard key={i} f={f} />
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -947,6 +1207,10 @@ export default function App() {
   const [slitherText, setSlitherText] = useState("");
   const [slitherError, setSlitherError] = useState(null);
   const [slitherCount, setSlitherCount] = useState(0);
+  const [repoInput, setRepoInput] = useState("");
+  const [repoLoading, setRepoLoading] = useState(false);
+  const [repoError, setRepoError] = useState(null);
+  const [repoOk, setRepoOk] = useState(null);
   const [fetchAddress, setFetchAddress] = useState("");
   const [fetchLoading, setFetchLoading] = useState(false);
   const [fetchError, setFetchError] = useState(null);
@@ -988,6 +1252,32 @@ export default function App() {
   }
   function removeFile(id) {
     setFiles((fs) => fs.filter((f) => f.id !== id));
+  }
+
+  async function scanRepo() {
+    setRepoError(null);
+    setRepoOk(null);
+    if (!repoInput.trim()) {
+      setRepoError("Enter a GitHub repo URL or owner/repo.");
+      return;
+    }
+    setRepoLoading(true);
+    try {
+      const { files: fetched, failures, total, wasCapped, branch } = await scanGithubRepo(repoInput);
+      setFiles((fs) => [
+        ...fs,
+        ...fetched.map((f) => ({ id: uid(), name: f.name, type: "solidity", code: f.code })),
+      ]);
+      let msg = `Loaded ${fetched.length} .sol file${fetched.length === 1 ? "" : "s"} from the ${branch} branch.`;
+      if (wasCapped) msg += ` (capped at 40 of ${total} found)`;
+      if (failures.length) msg += ` ${failures.length} file${failures.length === 1 ? "" : "s"} failed to fetch.`;
+      setRepoOk(msg);
+      setRepoInput("");
+    } catch (e) {
+      setRepoError(e.message);
+    } finally {
+      setRepoLoading(false);
+    }
   }
 
   async function fetchFromExplorer() {
@@ -1059,7 +1349,7 @@ export default function App() {
 
     const score = computeScore(findings);
     const summary = SEVERITY_ORDER.reduce((acc, s) => {
-      acc[s] = findings.filter((f) => f.severity === s).length;
+      acc[s] = findings.filter((f) => f.severity === s && f.category !== "gas").length;
       return acc;
     }, {});
     const entry = {
@@ -1070,6 +1360,7 @@ export default function App() {
       grade: gradeLabel(score),
       summary,
       findings,
+      stats: computeStats(active),
     };
     setResult(entry);
     setAnalyzing(false);
@@ -1278,6 +1569,24 @@ export default function App() {
           border-radius: 6px; padding: 4px 8px; display: flex; align-items: center; gap: 5px;
         }
         .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+        .stats-row { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--muted); margin-bottom: 14px; }
+        .results-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+        .diff-banner {
+          border: 1px solid var(--line); border-left: 3px solid var(--cyan); background: var(--panel);
+          border-radius: 8px; padding: 11px 14px; margin-bottom: 18px; font-size: 12.5px;
+        }
+        .diff-banner.diff-neutral { color: var(--muted); }
+        .diff-banner summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--text); }
+        .diff-banner summary::-webkit-details-marker { display: none; }
+        .diff-tag { font-family: 'IBM Plex Mono', monospace; font-size: 11px; border-radius: 12px; padding: 2px 9px; border: 1px solid var(--line); }
+        .diff-tag.diff-new { color: var(--coral); border-color: color-mix(in srgb, var(--coral) 45%, var(--line)); }
+        .diff-tag.diff-resolved { color: var(--cyan); border-color: color-mix(in srgb, var(--cyan) 45%, var(--line)); }
+        .diff-tag.diff-unchanged { color: var(--muted); }
+        .diff-body { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
+        .diff-section-title { font-family: 'IBM Plex Mono', monospace; font-size: 11px; margin-bottom: 4px; }
+        .diff-section-title.diff-new { color: var(--coral); }
+        .diff-section-title.diff-resolved { color: var(--cyan); }
+        .diff-item { color: var(--muted); font-size: 12.5px; padding: 2px 0; }
         .chip {
           display: flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 20px;
           padding: 5px 10px 5px 8px; opacity: 0.45;
@@ -1393,6 +1702,32 @@ export default function App() {
             </div>
 
             <div className="panel">
+              <div className="panel-title">Scan a GitHub repo (optional)</div>
+              <p className="hint" style={{ lineHeight: 1.6, marginBottom: 10 }}>
+                Pulls every .sol file from a public repo's default branch (up to 40 files) and loads them below,
+                ready to scan. Private repos aren't supported.
+              </p>
+              <div className="fetch-row">
+                <input
+                  className="fetch-input"
+                  value={repoInput}
+                  onChange={(e) => {
+                    setRepoInput(e.target.value);
+                    setRepoError(null);
+                  }}
+                  placeholder="owner/repo or https://github.com/owner/repo"
+                  spellCheck={false}
+                />
+                <button className="btn-outline" disabled={repoLoading} onClick={scanRepo}>
+                  {repoLoading ? <Loader2 size={14} className="spin" /> : null}
+                  {repoLoading ? "Scanning…" : "Scan repo"}
+                </button>
+              </div>
+              {repoError && <div className="import-error">{repoError}</div>}
+              {repoOk && !repoError && <div className="import-ok">{repoOk}</div>}
+            </div>
+
+            <div className="panel">
               <div className="panel-title">Fetch a deployed contract (optional)</div>
               <p className="hint" style={{ lineHeight: 1.6, marginBottom: 10 }}>
                 Tries a community Blockscout explorer first, then falls back to BlockDAG Engineering's if that one's
@@ -1498,7 +1833,7 @@ export default function App() {
 
             {result && (
               <div className="panel">
-                <ResultsPanel entry={result} onDownload={downloadReport} />
+                <ResultsPanel entry={result} onDownload={downloadReport} previousEntry={findPreviousComparable(history, result)} />
               </div>
             )}
           </>
@@ -1565,7 +1900,7 @@ export default function App() {
                 <Trash2 size={15} />
               </button>
             </div>
-            <ResultsPanel entry={detailItem} onDownload={downloadReport} />
+            <ResultsPanel entry={detailItem} onDownload={downloadReport} previousEntry={findPreviousComparable(history, detailItem)} />
           </div>
         )}
       </div>

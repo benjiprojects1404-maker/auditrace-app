@@ -59,11 +59,20 @@ function splitFunctions(code) {
   while ((m = fnRegex.exec(code))) {
     const start = m.index;
     const name = m[1];
-    const braceStart = code.indexOf("{", fnRegex.lastIndex);
-    if (braceStart === -1) continue;
-    const header = code.slice(start, braceStart);
+    const braceIdx = code.indexOf("{", fnRegex.lastIndex);
+    const semiIdx = code.indexOf(";", fnRegex.lastIndex);
+    if (braceIdx === -1) break;
+    if (semiIdx !== -1 && semiIdx < braceIdx) {
+      // Body-less declaration (interface / abstract function signature) — nothing to
+      // analyze as a function body, and critically: NOT safe to fall through to the
+      // next unrelated "{" elsewhere in the file (that corrupts everything in between
+      // into a bogus "body").
+      fnRegex.lastIndex = semiIdx + 1;
+      continue;
+    }
+    const header = code.slice(start, braceIdx);
     let depth = 0;
-    let i = braceStart;
+    let i = braceIdx;
     for (; i < code.length; i++) {
       if (code[i] === "{") depth++;
       else if (code[i] === "}") {
@@ -74,7 +83,7 @@ function splitFunctions(code) {
         }
       }
     }
-    const body = code.slice(braceStart, i);
+    const body = code.slice(braceIdx, i);
     results.push({ name, header, body, start });
     fnRegex.lastIndex = i;
   }
@@ -85,11 +94,12 @@ function parseContractContext(code) {
   const stateVars = new Set();
   const modifiers = new Set();
 
-  // Strip function/modifier/constructor bodies so what's left is
-  // (mostly) contract-level declarations — a cheap way to avoid
-  // treating local variables as state variables.
+  // Strip function/modifier/constructor/struct/interface/library bodies so what's
+  // left is (mostly) real contract-level declarations — struct fields and interface
+  // function signatures textually look just like state variable declarations
+  // (e.g. "address router;") and would otherwise be misidentified as one.
   const fnLike =
-    /(function\s+[a-zA-Z_$][\w$]*\s*\([^)]*\)[^{;]*|modifier\s+[a-zA-Z_$][\w$]*\s*\([^)]*\)[^{;]*|constructor\s*\([^)]*\)[^{;]*)\{/g;
+    /(function\s+[a-zA-Z_$][\w$]*\s*\([^)]*\)[^{;]*|modifier\s+[a-zA-Z_$][\w$]*\s*\([^)]*\)[^{;]*|constructor\s*\([^)]*\)[^{;]*|struct\s+[a-zA-Z_$][\w$]*\s*|interface\s+[a-zA-Z_$][\w$]*(?:\s+is\s+[^{]+)?\s*|library\s+[a-zA-Z_$][\w$]*\s*)\{/g;
   let m;
   let cursor = 0;
   let topLevel = "";
@@ -236,13 +246,13 @@ function analyzeSolidity(code, fileName) {
     )
   );
 
-  forEachMatch(code, /block\.timestamp|(^|[^.\w])now\b/g, (idx) =>
+  forEachMatch(code, /block\.timestamp/g, (idx) =>
     add(
       "medium",
-      "block.timestamp / now usage",
+      "block.timestamp usage",
       idx,
-      "block.timestamp (and the deprecated now) can be nudged within a small window by whoever produces the block.",
-      "Avoid using block.timestamp for randomness or strict equality checks; it's fine for coarse, tolerant time windows only."
+      "block.timestamp can be nudged within a small window by whoever produces the block.",
+      "Avoid relying on block.timestamp for randomness or strict equality checks; it's fine for coarse, tolerant time windows only."
     )
   );
 
@@ -271,7 +281,7 @@ function analyzeSolidity(code, fileName) {
     const after = code.slice(idx, idx + 160);
     const looksChecked =
       /require\s*\($/.test(before.trim()) ||
-      /\(\s*bool\s+\w+[^=(){}]*\)\s*=\s*[\w.]+$/.test(before) ||
+      /\(\s*bool\s+\w+[^=(){}]*\)\s*=\s*(?:payable\(|address\()?[\w.]+\)?$/.test(before) ||
       /success/i.test(before) ||
       /success/i.test(after.slice(0, 80));
     if (!looksChecked) {
@@ -328,6 +338,10 @@ function analyzeSolidity(code, fileName) {
     const hasReentrancyGuard =
       /nonReentrant/i.test(fn.header) ||
       knownModifiers.some((mod) => /reentr/i.test(mod) && new RegExp(`\\b${mod}\\b`).test(fn.header));
+    const hasAccessGuard =
+      hasCustomGuard ||
+      /onlyOwner|onlyAdmin|onlyRole/.test(fn.header) ||
+      /require\s*\(\s*msg\.sender/.test(fn.header + fn.body.slice(0, 200));
 
     // Reentrancy: only fires when the assignment target after the external
     // call is a real, contract-level state variable — not just any identifier.
@@ -357,11 +371,7 @@ function analyzeSolidity(code, fileName) {
     const isConstructor = /^\s*constructor/.test(fn.header);
 
     if (isExternalOrPublic && !isViewOrPure && looksStateChanging && !isConstructor) {
-      const hasGuard =
-        hasCustomGuard ||
-        /onlyOwner|onlyAdmin|onlyRole/.test(fn.header) ||
-        /require\s*\(\s*msg\.sender/.test(fn.header + fn.body.slice(0, 200));
-      if (!hasGuard) {
+      if (!hasAccessGuard) {
         add(
           "medium",
           "Public/external function without visible access control",
@@ -423,11 +433,15 @@ function analyzeSolidity(code, fileName) {
       }
     }
 
-    // Arbitrary send to a caller-supplied address
+    // Arbitrary send to a caller-supplied address (skip if the function is already
+    // access-controlled — an owner-gated rescue/admin function sending to an
+    // owner-chosen address is a deliberate admin action, not an open vulnerability).
     const addrParamMatch = fn.header.match(/address\s+(?:payable\s+)?([a-zA-Z_$][\w$]*)/);
-    if (addrParamMatch) {
+    if (addrParamMatch && !hasAccessGuard) {
       const p = addrParamMatch[1];
-      const sendRe = new RegExp(`\\b${p}\\.(transfer|send)\\(|\\b${p}\\.call\\{[^}]*value`);
+      const sendRe = new RegExp(
+        `\\b${p}\\.(transfer|send)\\(|\\b${p}\\.call\\{[^}]*value|payable\\(\\s*${p}\\s*\\)\\.(transfer|send)\\(|payable\\(\\s*${p}\\s*\\)\\.call\\{[^}]*value`
+      );
       const sendMatch = fn.body.match(sendRe);
       if (sendMatch) {
         const before = fn.body.slice(0, fn.body.indexOf(sendMatch[0]));
@@ -437,8 +451,8 @@ function analyzeSolidity(code, fileName) {
             "high",
             "Arbitrary send to a caller-supplied address",
             fn.start,
-            `Function "${fn.name}" sends value to address parameter "${p}" without an obvious require() validating that address first.`,
-            `Restrict what "${p}" is allowed to be, or require it to equal msg.sender, so callers can't redirect funds anywhere they choose.`
+            `Function "${fn.name}" sends value to address parameter "${p}" without an obvious require() validating that address first, and has no visible access-control guard.`,
+            `Restrict what "${p}" is allowed to be, require it to equal msg.sender, or gate this function behind access control so callers can't redirect funds anywhere they choose.`
           );
         }
       }
@@ -614,7 +628,7 @@ function analyzeFrontend(code, fileName) {
     )
   );
 
-  if (/window\.ethereum/.test(code) && !/if\s*\(\s*(window\.ethereum|typeof window\.ethereum)/.test(code)) {
+  if (/window\.ethereum/.test(code) && !/if\s*\(\s*!?\s*(window\.ethereum|typeof window\.ethereum)/.test(code)) {
     const idx = code.indexOf("window.ethereum");
     add(
       "low",
@@ -669,13 +683,29 @@ function analyzeFrontend(code, fileName) {
   );
 
   forEachMatch(code, /function\s+\w*[Ss]wap\w*\s*\([^)]*\)/g, (idx) => {
-    const header = code.slice(idx, idx + 200);
-    if (!/deadline|minOut|minAmountOut|slippage/i.test(header)) {
+    const braceStart = code.indexOf("{", idx);
+    let body = code.slice(idx, idx + 200);
+    if (braceStart !== -1) {
+      let depth = 0;
+      let i = braceStart;
+      for (; i < code.length; i++) {
+        if (code[i] === "{") depth++;
+        else if (code[i] === "}") {
+          depth--;
+          if (depth === 0) {
+            i++;
+            break;
+          }
+        }
+      }
+      body = code.slice(idx, i);
+    }
+    if (!/deadline|minOut|minAmountOut|slippage/i.test(body)) {
       add(
         "info",
         "Swap-like function without a visible deadline or slippage param",
         idx,
-        "A function that looks like a token swap has no obvious deadline or minimum-output parameter nearby.",
+        "A function that looks like a token swap has no obvious deadline or minimum-output handling anywhere in its body.",
         "Confirm slippage and deadline protections exist somewhere in the call path, to guard against sandwich attacks."
       );
     }
